@@ -1,1 +1,280 @@
 
+Correction 1: your temporal CHECK should almost certainly be valid_to > valid_from, not >=
+
+You say in the narrative:
+
+add CHECK (valid_to > valid_from OR valid_to = 'infinity')
+
+Then in the proposed DDL you use:
+
+CHECK (valid_to >= valid_from)
+
+Those are materially different.
+
+For a bitemporal version interval model with valid_from <= t < valid_to, a zero-width interval is usually useless and often a bug. If the intent is proper half-open intervals, then:
+
+CHECK (valid_to > valid_from)
+
+is the cleaner rule.
+
+Since 'infinity' > valid_from already evaluates true, you do not need a special OR branch.
+
+So I would change that to:
+
+CHECK (valid_to > valid_from)
+
+That is the better form.
+
+Correction 2: the blobs.node_id FK claim is shaky given the stated node PK
+
+You reproduced nodes as having composite PK:
+
+PRIMARY KEY (node_id, valid_from)
+
+Then you reproduced blobs.node_id as:
+
+node_id UUID | FK nodes, NULLABLE
+
+That cannot be a normal FK to nodes(node_id) unless there is also a unique constraint on nodes(node_id), which there is not in your reproduced schema.
+
+So one of these must be true:
+
+the spec is loose and means logical FK, not actual DB FK,
+
+there is an omitted unique constraint on current identity,
+
+blobs actually should reference a versioned node key (node_id, valid_from),
+
+blobs are intended to attach to entity identity, not a specific node version.
+
+Given the rest of the model, I suspect #1 or #4.
+
+So I would revise your phrasing here. Right now the report presents blobs.node_id as a concrete FK while also keeping composite PK on nodes, which is internally inconsistent.
+
+This is one of the most important structural corrections in your whole report.
+
+Correction 3: “missing index for dedup exact match” is directionally right, but your proposed index is not quite right for ILIKE
+
+You wrote:
+
+Tier 1 performs data->>'name' ILIKE $name
+add CREATE INDEX idx_nodes_data_name ON nodes ((data->>'name')) ...
+or trigram index for ILIKE
+
+The plain functional B-tree-style index on (data->>'name') will help with equality and ordering, but not generally with ILIKE. If the query is truly ILIKE, then the more honest recommendation is:
+
+either normalize and query exact lowercase match:
+
+lower(data->>'name') = lower($name)
+
+with an index on lower(data->>'name')
+
+or use trigram:
+
+gin ((data->>'name') gin_trgm_ops)
+
+So your instinct is right, but I would tighten the recommendation to the actual operator used.
+
+Correction 4: the “partial HNSW index” recommendation is smart, but should be framed as conditional, not corrective
+
+You already hinted at this, which is good. I would just push it further.
+
+This part of your report sounds slightly too definitive:
+
+Fix: Add a partial HNSW index ...
+
+That is only a fix if the deployed pgvector/Postgres combination fully supports the access pattern and the planner uses it well under the query workload. In practice, this is more like:
+
+Candidate optimization to benchmark on target Supabase version
+
+because ANN indexes are less transparent than B-tree indexes, and partial ANN support has historically deserved caution.
+
+So I agree with the idea, but I would downgrade it from “missing structure” to “optimization candidate pending validation.”
+
+Things I agree with, but would classify differently
+1. created_by_event on blobs
+
+You call this a gap. I’d call it a consistency improvement, not a real gap.
+
+Why:
+
+your own report notes the formal lineage invariant names nodes/edges/grants, not blobs
+
+blob_stored event already gives recoverable lineage if the payload includes blob identity
+
+blobs are auxiliary storage metadata, not graph facts in the same sense
+
+So yes, adding created_by_event is nice.
+But I would label it:
+
+Optional hardening for lineage symmetry
+
+rather than “required but missing.”
+
+2. tenant_id missing on store_blob and lookup_dict
+
+This is a good product/API observation, but it is not really a data model gap. It is a tool contract gap.
+
+That matters because your report sometimes blends:
+
+DB schema archaeology
+
+API ergonomics
+
+tool execution model
+
+Those are related, but they are not the same layer.
+
+I would keep the point, but move it under:
+
+“API contract mismatches”
+rather than “schema gaps.”
+
+3. no dict mutation path
+
+This is real, but again it is not a schema defect. It is a capability omission in the tool surface.
+
+Your own text already says that. I agree.
+
+One place where your wording should be sharper
+The edge versioning section
+
+You write:
+
+Edges simple PK — D-002's decision is correct; edge versioning adds complexity without gen1 use cases
+
+I mostly agree, but your own required operations include:
+
+query_at_time
+
+edge lifecycle
+
+graph exploration with temporal constraints
+
+edge removal as soft delete
+
+That means edges are already temporally modeled with valid_from / valid_to. So the true distinction is not “versioned vs not versioned,” but:
+
+nodes use identity + temporal row series under a composite PK, while edges use event-created row identity with mutable lifecycle columns.
+
+That is a more exact characterization.
+
+Why it matters: your phrasing makes it sound like edges are temporally simple, when they still carry temporal semantics. They just do not use the same identity/version design as nodes.
+
+One subtle but important modeling question you surfaced without fully finishing
+events.created_by and actor-node integrity
+
+You note the intentional cycle:
+
+events.created_by -> nodes.node_id
+
+bootstrap special case etc.
+
+This is a real hotspot in the model.
+
+The key question is: is events.created_by actually enforced as an FK?
+In your reproduction it is just:
+
+created_by UUID NOT NULL
+
+with no FK shown.
+
+Later in your structural analysis you describe it as if it participates in the dependency cycle.
+
+That is slightly unresolved in the report.
+
+I would make that explicit:
+
+If there is no actual FK, then actor identity is application-enforced.
+
+If there is an FK to nodes(node_id), that again collides with the composite PK issue unless there is a unique identity constraint.
+
+If the intended FK is to an actor registry outside nodes, that contradicts the graph-native design.
+
+This is another place where the composite-PK choice ripples out. Your report is strongest when it exposes these collisions directly.
+
+My adjusted classification of your gaps
+
+Here is how I would re-bucket them.
+
+True schema gaps
+
+These I endorse strongly:
+
+missing CHECK on nodes.epistemic
+
+missing CHECK on grants.capability
+
+missing CHECK on temporal ordering of nodes intervals
+
+Likely schema inconsistency / ambiguity
+
+These need clarification from spec or DDL:
+
+blobs.node_id as FK despite composite PK on nodes
+
+any implied FK from events.created_by to nodes.node_id
+
+API/tooling gaps rather than schema gaps
+
+missing tenant_id in store_blob params
+
+missing tenant_id in lookup_dict params
+
+no dict mutation tool
+
+remove_entity omitting tenant_id
+
+Optimization candidates
+
+name lookup index for dedup
+
+partial HNSW on active rows
+
+possible denormalized version counter
+
+stats materialization later
+
+Consistency enhancements
+
+created_by_event on blobs
+
+defaults on grant_id, blob_id, dict_id
+
+That last one is especially worth calling out: adding defaults for those PKs is nice consistency, but it is not evidence of a modeling bug unless the tool layer truly assumes server-side generation.
+
+On your proposed corrected schema
+
+I like the spirit of it. I would edit it in these ways:
+
+Keep
+
+epistemic CHECK
+
+capability CHECK
+
+reconsidered temporal CHECK
+
+possibly UUID defaults on secondary tables if consistent with implementation
+
+Change
+
+CHECK (valid_to >= valid_from) → CHECK (valid_to > valid_from)
+
+any node_id REFERENCES nodes should be revisited because of composite PK
+
+partial HNSW should be marked benchmark-required, not assumed
+
+created_by_event on blobs should either be NOT NULL if you want real consistency, or omitted; “optional lineage FK” is halfway
+
+That last point matters. Optional lineage FKs tend to encode uncertainty rather than design. If blob lineage is important, make it mandatory. If it is auxiliary, leave it out and rely on event payload.
+
+My final verdict in one sentence
+
+This is a high-quality systems reading with real architectural value.
+It catches the important invariants, correctly identifies several missing DB constraints, and surfaces the main operational risks. The biggest thing to tighten is the interaction between composite temporal identity on nodes and all the places that casually treat node_id as if it were a simple unique FK target.
+
+That tension is, to me, the deepest structural question in the whole model.
+
+If you want, I can turn this into a review memo with inline annotations:
+“agree / disagree / needs clarification” for each GAP, RISK, and schema change.
