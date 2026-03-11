@@ -38,7 +38,7 @@ Resonansia is a federated MCP server that exposes a bitemporal, event-sourced kn
 
 ### Core Invariants
 
-These invariants are **MATHEMATICALLY PROVEN** through database constraints and transaction boundaries:
+These invariants are **database-enforced** through constraints and transaction boundaries:
 
 #### PROVEN Invariants (Database-Enforced)
 
@@ -53,7 +53,7 @@ COMMIT; -- OR ROLLBACK (never partial state)
 ```
 - **Guarantee**: Either both event and projections succeed, or neither
 - **Enforcement**: PostgreSQL transaction boundaries
-- **Status**: PROVEN ✓
+- **Status**: ENFORCED ✓
 
 **INV-IMMUTABLE (Events are Append-Only)**
 ```sql
@@ -65,7 +65,7 @@ CREATE POLICY events_no_delete ON events
 ```
 - **Guarantee**: Events cannot be modified after creation
 - **Enforcement**: Row-Level Security policies
-- **Status**: PROVEN ✓
+- **Status**: ENFORCED ✓
 
 **INV-TENANT_ISOLATION (RLS + SET LOCAL Pattern)**
 ```sql
@@ -77,7 +77,7 @@ CREATE POLICY tenant_isolation ON nodes
 ```
 - **Guarantee**: Data access limited to authorized tenants only
 - **Enforcement**: SET LOCAL + RLS policies
-- **Status**: PROVEN ✓
+- **Status**: ENFORCED ✓
 
 **INV-BITEMPORALITY (Temporal Exclusion Constraints)**
 ```sql
@@ -87,7 +87,7 @@ ALTER TABLE nodes ADD CONSTRAINT nodes_temporal_exclusion
 ```
 - **Guarantee**: No entity can have overlapping temporal versions
 - **Enforcement**: PostgreSQL EXCLUDE constraints
-- **Status**: PROVEN ✓
+- **Status**: ENFORCED ✓
 
 **INV-LINEAGE (Complete Event Lineage)**
 ```sql
@@ -99,7 +99,7 @@ ALTER TABLE blobs ADD CONSTRAINT blobs_lineage_fk
 ```
 - **Guarantee**: Complete audit trail for all business data
 - **Enforcement**: Foreign key constraints
-- **Status**: PROVEN ✓
+- **Status**: ENFORCED ✓
 
 **INV-CROSS_TENANT_GRANTS (Validated Grant Dependency)**
 ```sql
@@ -110,7 +110,7 @@ CREATE TRIGGER edge_grant_validation
 ```
 - **Guarantee**: Cross-tenant edges require valid grants
 - **Enforcement**: Database triggers + application validation
-- **Status**: PROVEN ✓
+- **Status**: ENFORCED ✓
 
 ### System Architecture
 
@@ -525,7 +525,23 @@ $$ LANGUAGE plpgsql VOLATILE;
 ### Bootstrap Sequence
 
 ```sql
--- System tenant and metatype (self-referential bootstrap)
+-- Bootstrap sequence with deferred constraints to handle circular dependencies
+-- First, insert the system node without event reference
+INSERT INTO nodes (
+    node_id, tenant_id, type_node_id, data, epistemic,
+    created_by_event, valid_from, version
+) VALUES (
+    '00000000-0000-7000-0000-000000000001'::uuid,
+    '00000000-0000-7000-0000-000000000000'::uuid,
+    '00000000-0000-7000-0000-000000000001'::uuid,  -- Self-reference
+    '{"name": "type", "schema": {"type": "object", "properties": {"name": {"type": "string"}, "schema": {"type": "object"}}}}'::jsonb,
+    'confirmed',
+    '00000000-0000-7000-0000-000000000001'::uuid,  -- Will exist after next INSERT
+    now(),
+    1
+) ON CONFLICT DO NOTHING;
+
+-- Then create the bootstrap event that references the now-existing system node
 INSERT INTO events (
     event_id, tenant_id, stream_id, intent_type, payload,
     occurred_at, recorded_at, created_by
@@ -537,21 +553,7 @@ INSERT INTO events (
     '{"type": "type", "name": "type", "schema": {"type": "object"}}'::jsonb,
     now(),
     now(),
-    '00000000-0000-7000-0000-000000000000'::uuid
-) ON CONFLICT DO NOTHING;
-
-INSERT INTO nodes (
-    node_id, tenant_id, type_node_id, data, epistemic,
-    created_by_event, valid_from, version
-) VALUES (
-    '00000000-0000-7000-0000-000000000001'::uuid,
-    '00000000-0000-7000-0000-000000000000'::uuid,
-    '00000000-0000-7000-0000-000000000001'::uuid,  -- Self-reference
-    '{"name": "type", "schema": {"type": "object", "properties": {"name": {"type": "string"}, "schema": {"type": "object"}}}}'::jsonb,
-    'confirmed',
-    '00000000-0000-7000-0000-000000000001'::uuid,
-    now(),
-    1
+    '00000000-0000-7000-0000-000000000001'::uuid  -- Now points to existing system node
 ) ON CONFLICT DO NOTHING;
 
 -- Core entity types
@@ -1126,13 +1128,7 @@ async function storeEntity(params: StoreEntityParams, auth: AuthContext): Promis
     throw new ValidationError(`Schema validation failed: ${validationResult.validation_errors!.join(', ')}`);
   }
 
-  // Optimistic concurrency check
-  if (isUpdate && params.expected_version) {
-    const currentVersion = await getCurrentVersion(nodeId);
-    if (currentVersion !== params.expected_version) {
-      throw new ConcurrencyError(`Version mismatch. Expected: ${params.expected_version}, Current: ${currentVersion}`);
-    }
-  }
+  // Optimistic concurrency check will be done inside transaction
 
   const eventId = generateUUIDv7();
   const intentType = isUpdate ? 'entity_updated' : 'entity_created';
@@ -1166,11 +1162,24 @@ async function storeEntity(params: StoreEntityParams, auth: AuthContext): Promis
     ]);
 
     if (isUpdate) {
-      // Close previous version
-      await tx.query(`
-        UPDATE nodes SET valid_to = $1 
-        WHERE node_id = $2 AND valid_to IS NULL
-      `, [now, nodeId]);
+      // Optimistic concurrency check inside transaction
+      if (params.expected_version) {
+        const updateResult = await tx.query(`
+          UPDATE nodes SET valid_to = $1 
+          WHERE node_id = $2 AND valid_to IS NULL AND version = $3
+          RETURNING version
+        `, [now, nodeId, params.expected_version]);
+        
+        if (updateResult.rows.length === 0) {
+          throw new ConcurrencyError(`Version mismatch. Expected: ${params.expected_version}`);
+        }
+      } else {
+        // Close previous version without version check
+        await tx.query(`
+          UPDATE nodes SET valid_to = $1 
+          WHERE node_id = $2 AND valid_to IS NULL
+        `, [now, nodeId]);
+      }
       
       // Get previous version
       const prev = await tx.query(`
@@ -1362,19 +1371,31 @@ async function findEntities(params: FindEntitiesParams, auth: AuthContext): Prom
     paramCount++;
   }
 
-  // Structured filters
+  // Structured filters with key validation
   if (params.filters) {
     for (const [key, value] of Object.entries(params.filters)) {
-      if (Array.isArray(value)) {
-        // $in operator
-        baseQuery += ` AND n.data->>'${key}' = ANY($${paramCount + 1})`;
-        queryParams.push(value);
-      } else {
-        // Equality operator
-        baseQuery += ` AND n.data->>'${key}' = $${paramCount + 1}`;
-        queryParams.push(String(value));
+      // Validate filter key to prevent SQL injection
+      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
+        throw new ValidationError(`Invalid filter key format: ${key}`);
       }
-      paramCount++;
+      
+      // Whitelist approach for known safe columns
+      const allowedKeys = ['name', 'email', 'status', 'type', 'category', 'description', 'title'];
+      if (!allowedKeys.includes(key)) {
+        throw new ValidationError(`Filter key not in allowlist: ${key}`);
+      }
+      
+      if (Array.isArray(value)) {
+        // $in operator with quoted identifier
+        baseQuery += ` AND n.data->>$${paramCount + 1} = ANY($${paramCount + 2})`;
+        queryParams.push(key, value);
+        paramCount += 2;
+      } else {
+        // Equality operator with quoted identifier
+        baseQuery += ` AND n.data->>$${paramCount + 1} = $${paramCount + 2}`;
+        queryParams.push(key, String(value));
+        paramCount += 2;
+      }
     }
   }
 
@@ -1406,12 +1427,70 @@ async function findEntities(params: FindEntitiesParams, auth: AuthContext): Prom
   const hasMore = results.rows.length > limit;
   const actualResults = hasMore ? results.rows.slice(0, limit) : results.rows;
   
-  // Get total count for pagination
-  const countQuery = baseQuery
-    .replace(/SELECT.*?FROM/, 'SELECT COUNT(*) FROM')
-    .replace(/ORDER BY.*$/, '')
-    .replace(/LIMIT.*$/, '');
-  const countResult = await db.query(countQuery, queryParams.slice(0, -2));
+  // Get total count for pagination - build separate query instead of string manipulation
+  let countQuery = `
+    SELECT COUNT(*) FROM nodes n
+    JOIN nodes t ON n.type_node_id = t.node_id
+    WHERE n.valid_to IS NULL 
+      AND t.tenant_id = '00000000-0000-7000-0000-000000000000'::uuid
+      AND t.data->>'name' != 'type'
+  `;
+  
+  const countParams: unknown[] = [];
+  let countParamCount = 0;
+
+  // Rebuild count query conditions to match main query (without string manipulation)
+  if (queryEmbedding) {
+    countQuery += ` AND n.embedding IS NOT NULL AND (1 - (n.embedding <=> $${countParamCount + 1}::vector)) >= $${countParamCount + 2}`;
+    countParams.push(JSON.stringify(queryEmbedding), params.similarity_threshold || 0.7);
+    countParamCount += 2;
+  }
+
+  countQuery += ` AND n.tenant_id = $${countParamCount + 1}`;
+  countParams.push(tenantId);
+  countParamCount++;
+
+  if (!params.include_deleted) {
+    countQuery += ` AND n.is_deleted = false`;
+  }
+
+  if (params.entity_types && params.entity_types.length > 0) {
+    countQuery += ` AND t.data->>'name' = ANY($${countParamCount + 1})`;
+    countParams.push(params.entity_types);
+    countParamCount++;
+  }
+
+  if (params.epistemic && params.epistemic.length > 0) {
+    countQuery += ` AND n.epistemic = ANY($${countParamCount + 1})`;
+    countParams.push(params.epistemic);
+    countParamCount++;
+  }
+
+  if (params.filters) {
+    for (const [key, value] of Object.entries(params.filters)) {
+      // Apply same validation as main query
+      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
+        continue; // Skip invalid keys for count
+      }
+      
+      const allowedKeys = ['name', 'email', 'status', 'type', 'category', 'description', 'title'];
+      if (!allowedKeys.includes(key)) {
+        continue; // Skip non-allowlisted keys for count
+      }
+      
+      if (Array.isArray(value)) {
+        countQuery += ` AND n.data->>$${countParamCount + 1} = ANY($${countParamCount + 2})`;
+        countParams.push(key, value);
+        countParamCount += 2;
+      } else {
+        countQuery += ` AND n.data->>$${countParamCount + 1} = $${countParamCount + 2}`;
+        countParams.push(key, String(value));
+        countParamCount += 2;
+      }
+    }
+  }
+
+  const countResult = await db.query(countQuery, countParams);
   const totalCount = parseInt(countResult.rows[0].count);
 
   const searchTime = Date.now() - startTime;
@@ -3557,7 +3636,10 @@ describe('Performance Requirements', () => {
     expect(cpuTime).toBeLessThan(2000); // 2s CPU limit
     expect(wallTime).toBeLessThan(150000); // 150s wall-clock limit
     
-    // Our performance targets
+    // Our performance targets - NOTE: CPU budget is tight for capture_thought
+    // 2s CPU limit with 3-4 sequential API calls (LLM extraction, embedding generation, 
+    // deduplication queries) may require queue-based architecture or splitting into 
+    // multiple edge function invocations for complex thought processing
     expect(wallTime).toBeLessThan(10000); // 10s target for complex extraction
     expect(result.processing_stats.cpu_time_ms).toBeLessThan(1500); // Leave headroom
     
@@ -4020,9 +4102,9 @@ This matrix **PROVES** that all invariants are properly enforced, preserved, and
 | **II-01** | 4C | P0 | Sync vs async embedding decision | Sync with 15s timeout, graceful degradation | CPU budget analysis provided |
 | **II-02** | 4C | P0 | RLS performance concerns | Hybrid approach with database triggers | Performance benchmarks included |
 | **II-03** | 4C | P1 | Test environment setup | Complete Supabase + Deno instructions | Setup guide provided |
-| **II-04** | 4C | P1 | Implementation precision gaps | No judgment calls needed, full specifications | Ready for coding |
+| **II-04** | 4C | P1 | Implementation precision gaps | Comprehensive specifications provided | Ready for coding |
 
-**Resolution Rate**: 100% (12/12 critical and high-priority findings resolved)
+**Resolution Rate**: Complete coverage (12/12 critical and high-priority findings resolved)
 
 ---
 
@@ -4036,7 +4118,7 @@ This matrix **PROVES** that all invariants are properly enforced, preserved, and
 - [x] Invariant preservation verified through database constraints + tests
 
 ### ✅ **Implementation Readiness**
-- [x] No judgment calls required during implementation
+- [x] Minimal design decisions required during implementation
 - [x] Complete database schema with exact DDL
 - [x] All tool parameters and responses precisely defined
 - [x] Error handling standardized across all operations
@@ -4064,11 +4146,11 @@ This matrix **PROVES** that all invariants are properly enforced, preserved, and
 
 ## **FINAL INTEGRATION COMPLETE — SPECIFICATION DELIVERED**
 
-This specification represents the **complete, corrected, and implementation-ready** blueprint for the Resonansia federated MCP server. Every issue identified across 5 waves and 14 agents has been resolved through systematic integration.
+This specification represents a **corrected and implementation-ready** blueprint for the Resonansia federated MCP server. Issues identified across 5 waves and 14 agents have been systematically addressed through integration.
 
-**Ready for Production Implementation**: The specification provides complete behavioral specifications for all 18 MCP tools, exact database schemas with constraints, comprehensive error handling, security verification, and detailed work packages that can be executed without design decisions.
+**Ready for Production Implementation**: The specification provides behavioral specifications for all 18 MCP tools, database schemas with constraints, error handling, security verification, and detailed work packages that can be executed with minimal design decisions.
 
-**Quality Assurance**: All CRITICAL findings have been resolved, all MAJOR issues addressed, and all P0/P1 implementation blockers removed. The system is **mathematically proven correct** through database constraints and **implementation-ready** through complete specifications.
+**Quality Assurance**: CRITICAL findings have been resolved, MAJOR issues addressed, and P0/P1 implementation blockers removed. The system is **constraint-enforced** through database constraints and **implementation-ready** through comprehensive specifications.
 
 **Next Steps**: Execute work packages WP-01 through WP-18 in dependency order, following the provided implementation guidance, test specifications, and deployment instructions.
 
